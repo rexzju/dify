@@ -9,9 +9,12 @@
       "anchors": [
         "def _parse_structured_output(result_text: str) -> Mapping[str, Any]:",
         "TypeAdapter(Mapping).validate_json(result_text)",
-        "temp_parsed = json_repair.loads(result_text)"
+        "temp_parsed = json_repair.loads(result_text)",
+        "def _handle_native_json_schema(",
+        "processed_schema = dict(deepcopy(schema))",
+        "schema_str = json.dumps(structured_output_schema, ensure_ascii=False)"
       ],
-      "reason": "推理模型思维链污染结构化输出：流式路径下 api 侧解析收到含 <think> 的原始流，json_repair 把思维链里的 schema 片段修成空壳 dict。补丁在解析前剥离 <think> 块。"
+      "reason": "1) 推理模型思维链污染结构化输出：流式路径下 api 侧解析收到含 <think> 的原始流，json_repair 把思维链里的 schema 片段修成空壳 dict；补丁在解析前剥离 <think> 块。2) 结构化输出缺 key 兜底：上游只保证「是 JSON 对象」不按 schema 补全，模型漏吐字段会让下游强类型消费方（LLM 模板/赋值器/IF）VariableNotFoundError 硬失败并 abort；补丁按 schema 补全缺失字段（default 优先，否则类型零值）并写入 __degraded__ 标注，外发 provider/提示词前剥离 default。"
     }
   ]
 }

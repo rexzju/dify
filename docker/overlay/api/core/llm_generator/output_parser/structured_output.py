@@ -154,7 +154,7 @@ def invoke_llm_with_structured_output(
             )
 
         return LLMResultWithStructuredOutput(
-            structured_output=_parse_structured_output(llm_result.message.content),
+            structured_output=_parse_structured_output(llm_result.message.content, json_schema),
             model=llm_result.model,
             message=llm_result.message,
             usage=llm_result.usage,
@@ -188,7 +188,7 @@ def invoke_llm_with_structured_output(
                 )
 
             yield LLMResultChunkWithStructuredOutput(
-                structured_output=_parse_structured_output(result_text),
+                structured_output=_parse_structured_output(result_text, json_schema),
                 model=model_schema.model,
                 prompt_messages=prompt_messages,
                 system_fingerprint=system_fingerprint,
@@ -260,7 +260,10 @@ def _handle_prompt_based_schema(
         list[PromptMessage]: Updated prompt messages with structured output requirements
     """
     # Convert schema to string format
-    schema_str = json.dumps(structured_output_schema, ensure_ascii=False)
+    # [overlay] 提示词路径剥离 default 等不支持关键字：否则模型会误以为该字段可省略
+    prompt_schema = dict(deepcopy(structured_output_schema))
+    _strip_unsupported_keywords(prompt_schema)
+    schema_str = json.dumps(prompt_schema, ensure_ascii=False)
 
     # Find existing system prompt with schema placeholder
     system_prompt = next(
@@ -307,7 +310,134 @@ def _strip_reasoning_blocks(text: str) -> str:
     return cleaned.strip()
 
 
-def _parse_structured_output(result_text: str) -> Mapping[str, Any]:
+# ==== [overlay] 二次开发补丁：结构化输出「缺 key」兜底（schema 驱动） ====
+# 背景：上游 _parse_structured_output 只保证「是 JSON 对象」，不按 schema 校验/补全。
+#       模型漏吐字段时，下游强类型消费方（LLM 提示词 / 变量赋值器 / IF-ELSE）会
+#       VariableNotFoundError 硬失败并 abort 整个 run。
+# 方案：解析后按 schema 补全缺失字段——有 default 用 default，否则补类型零值；
+#       并把被兜底的字段路径写进保留键 __degraded__，供下游区分「真值 vs 兜底值」。
+#       仅当缺失时才兜底（模型正常输出的字段原样保留），不引入额外歧义。
+# 注意：default 仅本地解析端使用，外发 provider/提示词前由 _strip_unsupported_keywords 剥离。
+# 兼容校验：docker/overlay/verify-overlay.py
+_DEGRADED_KEY = "__degraded__"
+# provider 不支持或会误导模型的 JSON Schema 关键字（仅本地解析端消费）
+_UNSUPPORTED_SCHEMA_KEYWORDS = ("default",)
+_MISSING = object()
+
+
+def _strip_unsupported_keywords(schema: Any) -> None:
+    """[overlay] 就地移除 schema 里 provider/提示词不支持的关键字（如 default）。"""
+    if not isinstance(schema, dict):
+        return
+    for keyword in _UNSUPPORTED_SCHEMA_KEYWORDS:
+        schema.pop(keyword, None)
+    for value in schema.values():
+        if isinstance(value, dict):
+            _strip_unsupported_keywords(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    _strip_unsupported_keywords(item)
+
+
+def _zero_value(prop_schema: Mapping[str, Any]) -> Any:
+    """[overlay] 按声明类型给出安全零值。"""
+    ptype = prop_schema.get("type") if isinstance(prop_schema, Mapping) else None
+    match ptype:
+        case "array":
+            return []
+        case "object":
+            return {}
+        case "integer" | "number":
+            return 0
+        case "boolean":
+            return False
+        case _:
+            return ""
+
+
+def _complete_value(
+    prop_schema: Mapping[str, Any],
+    value: Any,
+    path: str,
+    degraded: list[str],
+) -> Any:
+    """[overlay] 按 schema 递归补全单个节点；缺失字段记入 degraded。"""
+    schema = prop_schema if isinstance(prop_schema, Mapping) else {}
+    props = schema.get("properties")
+    is_object = schema.get("type") == "object" or isinstance(props, Mapping)
+    stype = schema.get("type")
+
+    # 缺失或显式 null：优先 default，其次按类型补零（对象递归补全其子字段）
+    if value is _MISSING or value is None:
+        if "default" in schema:
+            degraded.append(path)
+            return deepcopy(schema["default"])
+        if is_object:
+            obj: dict[str, Any] = {}
+            for key, child_schema in (props or {}).items():
+                child_path = f"{path}.{key}" if path else key
+                obj[key] = _complete_value(child_schema, _MISSING, child_path, degraded)
+            if not props:
+                degraded.append(path)
+            return obj
+        degraded.append(path)
+        return _zero_value(schema)
+
+    # 对象已存在：逐字段补全，保留模型额外产出的键
+    if is_object and isinstance(value, Mapping):
+        out: dict[str, Any] = {}
+        for key, child_schema in (props or {}).items():
+            child_path = f"{path}.{key}" if path else key
+            if key in value:
+                out[key] = _complete_value(child_schema, value[key], child_path, degraded)
+            else:
+                out[key] = _complete_value(child_schema, _MISSING, child_path, degraded)
+        for key, val in value.items():
+            if key not in (props or {}):
+                out[key] = val
+        return out
+
+    # 数组已存在：按 items schema 逐项补全
+    if stype == "array" and isinstance(value, list):
+        items_schema = schema.get("items") or {}
+        return [
+            _complete_value(items_schema, item, f"{path}[{idx}]", degraded)
+            for idx, item in enumerate(value)
+        ]
+
+    return value
+
+
+def _apply_schema_defaults(
+    structured_output: Mapping[str, Any],
+    json_schema: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    """[overlay] 按 JSON Schema 补全结构化输出的缺失字段。
+
+    - 有 ``default`` 用 ``default``，否则补类型零值（``""`` / ``[]`` / ``{}`` / ``0``）；
+    - 对象/数组递归补全，保证下游任意层级取值都不会缺 key；
+    - 被兜底的字段路径写入保留键 ``__degraded__``（无缺失时为 ``[]``）。
+    """
+    if not isinstance(json_schema, Mapping):
+        return structured_output
+    props = json_schema.get("properties")
+    if not isinstance(props, Mapping) or not props:
+        # 无 schema 或未声明字段：不兜底，保持上游行为
+        return structured_output
+
+    degraded: list[str] = []
+    completed = _complete_value(json_schema, dict(structured_output), "", degraded)
+    if not isinstance(completed, dict):
+        return structured_output
+    completed[_DEGRADED_KEY] = degraded
+    return completed
+
+
+def _parse_structured_output(
+    result_text: str,
+    json_schema: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
     # [overlay] 解析前剥离思维链，避免 json_repair 误取思维链片段
     result_text = _strip_reasoning_blocks(result_text)
     structured_output: Mapping[str, Any] = {}
@@ -329,7 +459,8 @@ def _parse_structured_output(result_text: str) -> Mapping[str, Any]:
             case _:
                 raise OutputParserError(f"Failed to parse structured output: {result_text}")
         structured_output = cast(dict, temp_parsed)
-    return structured_output
+    # [overlay] 按 schema 补全缺失字段 + 标注兜底字段
+    return _apply_schema_defaults(structured_output, json_schema)
 
 
 def _prepare_schema_for_model(provider: str, model_schema: AIModelEntity, schema: Mapping):
@@ -345,6 +476,9 @@ def _prepare_schema_for_model(provider: str, model_schema: AIModelEntity, schema
 
     # Deep copy to avoid modifying the original schema
     processed_schema = dict(deepcopy(schema))
+
+    # [overlay] 剥离 default 等 provider 不支持的关键字（仅本地解析端使用 default）
+    _strip_unsupported_keywords(processed_schema)
 
     # Convert boolean types to string types (common requirement)
     convert_boolean_to_string(processed_schema)
