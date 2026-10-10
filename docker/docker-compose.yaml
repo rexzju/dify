@@ -506,6 +506,43 @@ services:
           "redis-cli -a ${REDIS_PASSWORD:-difyai123456} ping | grep -q PONG",
         ]
 
+  # MLflow tracking server (optional, for Agent/LLM observability via Dify Tracing)
+  # Data (SQLite backend + artifacts) is persisted under ./volumes/mlflow
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:${MLFLOW_VERSION:-v3.16.1}
+    restart: always
+    command:
+      - mlflow
+      - server
+      - --host
+      - 0.0.0.0
+      - --port
+      - ${MLFLOW_PORT:-5000}
+      - --backend-store-uri
+      - sqlite:////mlflow/mlflow.db
+      - --default-artifact-root
+      - /mlflow/artifacts
+    ports:
+      - "${MLFLOW_PORT:-5000}:${MLFLOW_PORT:-5000}"
+    environment:
+      # Allow the compose service name + localhost hosts, otherwise the
+      # server rejects requests with "Invalid Host header - possible DNS
+      # rebinding attack detected" (MLflow >= 3.5 DNS rebinding protection)
+      MLFLOW_SERVER_ALLOWED_HOSTS: ${MLFLOW_ALLOWED_HOSTS:-mlflow,mlflow:5000,localhost,localhost:5000,127.0.0.1,127.0.0.1:5000}
+    volumes:
+      - ./volumes/mlflow:/mlflow
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:${MLFLOW_PORT:-5000}/health')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
   # The DifySandbox
   sandbox:
     image: langgenius/dify-sandbox:0.2.15
@@ -1296,6 +1333,35 @@ services:
     restart: always
     volumes:
       - ./volumes/unstructured:/app/data
+
+  # Local inference server for Rerank / TTS / ASR (Xorbits Inference).
+  # Serves bge-reranker-v2-m3, CosyVoice2-0.5B (zh/en TTS), SenseVoiceSmall (ASR).
+  # Model cache is shared with the host at ~/.xinference.
+  xinference:
+    container_name: xinference
+    image: xprobe/xinference:latest-cpu
+    restart: always
+    # tts_patch.py replaces torchaudio.save (requires CUDA-only torchcodec)
+    # with soundfile+ffmpeg so CosyVoice TTS works in the CPU container.
+    command: ["bash", "-c", "uv pip install --python /opt/conda/bin/python soundfile --index-url https://pypi.tuna.tsinghua.edu.cn/simple >/dev/null 2>&1; python /root/.xinference/tts_patch.py; exec xinference-local --host 0.0.0.0 --port 9997"]
+    environment:
+      XINFERENCE_AUTH_ADVANCED: "false"
+      HF_ENDPOINT: https://hf-mirror.com
+      UV_DEFAULT_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple
+      PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+    volumes:
+      - ./volumes/xinference:/root/.xinference
+    ports:
+      - 9997:9997
+    networks:
+      - default
+
+  # 绘本生产线 MCP Server（pb_backend_mcp）—— 已迁出本文件。
+  # TG-EAIP-Dify（ADR-012 / delta 变更 3）：旧路径退休，service 定义已搬入 EAIP Compose：
+  #   enterprise_agent_intelligence_platform/deploy/docker-compose.yml（profiles:["legacy-mcp"]，默认不激活）
+  # 回滚（E2E-11）：
+  #   docker compose -f <EAIP>/deploy/docker-compose.yml --profile legacy-mcp up -d pb_backend_mcp
+  # 既有镜像 docker-pb_backend_mcp:latest 保留一迭代周期（禁 rebuild）；本文件保留 .env 的 PB_MCP_*（同周期）。
 
 networks:
   # create a network between sandbox, api and ssrf_proxy, and can not access outside.

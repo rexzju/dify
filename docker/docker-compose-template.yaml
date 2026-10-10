@@ -500,6 +500,43 @@ services:
           "redis-cli -a ${REDIS_PASSWORD:-difyai123456} ping | grep -q PONG",
         ]
 
+  # MLflow tracking server (optional, for Agent/LLM observability via Dify Tracing)
+  # Data (SQLite backend + artifacts) is persisted under ./volumes/mlflow
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:${MLFLOW_VERSION:-v3.16.1}
+    restart: always
+    command:
+      - mlflow
+      - server
+      - --host
+      - 0.0.0.0
+      - --port
+      - ${MLFLOW_PORT:-5000}
+      - --backend-store-uri
+      - sqlite:////mlflow/mlflow.db
+      - --default-artifact-root
+      - /mlflow/artifacts
+    ports:
+      - "${MLFLOW_PORT:-5000}:${MLFLOW_PORT:-5000}"
+    environment:
+      # Allow the compose service name + localhost hosts, otherwise the
+      # server rejects requests with "Invalid Host header - possible DNS
+      # rebinding attack detected" (MLflow >= 3.5 DNS rebinding protection)
+      MLFLOW_SERVER_ALLOWED_HOSTS: ${MLFLOW_ALLOWED_HOSTS:-mlflow,mlflow:5000,localhost,localhost:5000,127.0.0.1,127.0.0.1:5000}
+    volumes:
+      - ./volumes/mlflow:/mlflow
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:${MLFLOW_PORT:-5000}/health')",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
   # The DifySandbox
   sandbox:
     image: langgenius/dify-sandbox:0.2.15
@@ -1290,6 +1327,60 @@ services:
     restart: always
     volumes:
       - ./volumes/unstructured:/app/data
+
+  # Local inference server for Rerank / TTS / ASR (Xorbits Inference).
+  # Serves bge-reranker-v2-m3, CosyVoice2-0.5B (zh/en TTS), SenseVoiceSmall (ASR).
+  # Model cache is shared with the host at ~/.xinference.
+  xinference:
+    container_name: xinference
+    image: xprobe/xinference:latest-cpu
+    restart: always
+    # tts_patch.py replaces torchaudio.save (requires CUDA-only torchcodec)
+    # with soundfile+ffmpeg so CosyVoice TTS works in the CPU container.
+    command: ["bash", "-c", "uv pip install --python /opt/conda/bin/python soundfile --index-url https://pypi.tuna.tsinghua.edu.cn/simple >/dev/null 2>&1; python /root/.xinference/tts_patch.py; exec xinference-local --host 0.0.0.0 --port 9997"]
+    environment:
+      XINFERENCE_AUTH_ADVANCED: "false"
+      HF_ENDPOINT: https://hf-mirror.com
+      UV_DEFAULT_INDEX: https://pypi.tuna.tsinghua.edu.cn/simple
+      PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+    volumes:
+      - ./volumes/xinference:/root/.xinference
+    ports:
+      - 9997:9997
+    networks:
+      - default
+
+  # 绘本生产线 MCP Server（lovely_children/mcp_servers/pb_backend）
+  # 把 Backend 的机对机接口 + 即梦出图网关暴露为 MCP 工具，供 Dify「工具节点」确定性调用
+  # （不经 LLM，且输出为逐字段命名变量，下游 `{{#节点.字段#}}` 直接引用、无需再解析 JSON）。
+  # 鉴权：请求头 X-System-Key，值取自 PB_MCP_SYSTEM_API_KEY（不落画布）。
+  pb_backend_mcp:
+    container_name: pb_backend_mcp
+    build:
+      context: ../../lovely_children/mcp_servers/pb_backend
+    restart: always
+    environment:
+      PB_SYSTEM_API_KEY: ${PB_MCP_SYSTEM_API_KEY:-}
+      PB_BACKEND_BASE_URL: ${PB_MCP_BACKEND_BASE_URL:-http://host.docker.internal:8001}
+      PB_JIMENG_BASE_URL: ${PB_MCP_JIMENG_BASE_URL:-http://host.docker.internal:8005}
+      PB_BACKEND_TIMEOUT: ${PB_MCP_TIMEOUT:-180}
+    ports:
+      - "${PB_MCP_PORT:-8765}:8765"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import socket; socket.create_connection(('127.0.0.1', 8765), 2).close()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    networks:
+      - default
 
 networks:
   # create a network between sandbox, api and ssrf_proxy, and can not access outside.
