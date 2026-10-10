@@ -198,6 +198,7 @@ docker/volumes/mysql/*
 docker/volumes/seekdb/*
 !docker/volumes/oceanbase/init.d
 docker/volumes/iris/*
+docker/volumes/xinference/*
 
 docker/nginx/conf.d/default.conf
 docker/nginx/ssl/*
@@ -269,3 +270,8 @@ web/.vitest-reports/
 # dify-agent-runtime
 dify-agent-runtime/bin/
 dify-agent-runtime/.integration-state
+
+# ==== [custom] 本地/运行时产物（lovely_children 二次开发，不纳入 Git）====
+tmp_deliverables/
+docker/.env.bak-*
+docker/.env.bak.*
