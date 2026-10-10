@@ -1,0 +1,17 @@
+# 二次开发覆盖层（Overlay Layer）：把使用官方 dify-api 镜像的服务指向自定义镜像。
+# 与上游 docker-compose.yaml 解耦 —— 上游 compose 更新时本文件零冲突。
+#
+# 用法：
+#   docker build -f docker/Dockerfile.custom -t dify-api-overlay:1.17.1 docker
+#   docker compose -f docker/docker-compose.yaml -f docker/docker-compose.override.yaml up -d
+#
+# 升级上游前：先跑 `python3 docker/overlay/verify-overlay.py --target upstream/<新tag>`。
+services:
+  api:
+    image: dify-api-overlay:1.17.1
+  worker:
+    image: dify-api-overlay:1.17.1
+  api_websocket:
+    image: dify-api-overlay:1.17.1
+  worker_beat:
+    image: dify-api-overlay:1.17.1

@@ -1,0 +1,14 @@
+# 二次开发自定义镜像：在官方镜像之上叠加 Overlay 层（不 fork 全量源码）。
+#
+# 构建（build context = docker/）：
+#   docker build -f docker/Dockerfile.custom -t dify-api-overlay:1.17.1 .
+#
+# 说明：overlay/ 按镜像内 /app 的相对结构组织；只 COPY 代码子树（overlay/<dir>/ -> /app/<dir>/）。
+#   ⚠️ 必须 --chown=1001:1001（镜像内 dify 用户），否则 COPY 会把 /app/api 重归 root，
+#      导致 worker_beat 建 storage 目录 PermissionError 而崩溃。
+#   ⚠️ 不要 `COPY overlay/ /app/`（会把 VERSION/manifest/verify-overlay.py 等元文件也灌进 /app）。
+# 升级上游时：改 ARG UPSTREAM_IMAGE 的 tag -> 先跑 docker/overlay/verify-overlay.py -> 再 build。
+ARG UPSTREAM_IMAGE=langgenius/dify-api:1.17.1
+FROM ${UPSTREAM_IMAGE}
+
+COPY --chown=1001:1001 overlay/api/ /app/api/

@@ -1,0 +1,17 @@
+{
+  "base_version": "1.17.1",
+  "description": "Dify 二次开发覆盖层（Overlay Layer）。升级上游前必须先跑 docker/overlay/verify-overlay.py 校验兼容性。",
+  "files": [
+    {
+      "path": "api/core/llm_generator/output_parser/structured_output.py",
+      "patch_marker": "_strip_reasoning_blocks",
+      "base_sha256": "bf69abddfe2a0f662177d0bf3f9cae3284fc50d51ab6816c3561fff8d13dc943",
+      "anchors": [
+        "def _parse_structured_output(result_text: str) -> Mapping[str, Any]:",
+        "TypeAdapter(Mapping).validate_json(result_text)",
+        "temp_parsed = json_repair.loads(result_text)"
+      ],
+      "reason": "推理模型思维链污染结构化输出：流式路径下 api 侧解析收到含 <think> 的原始流，json_repair 把思维链里的 schema 片段修成空壳 dict。补丁在解析前剥离 <think> 块。"
+    }
+  ]
+}
